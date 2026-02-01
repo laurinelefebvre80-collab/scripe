@@ -7,7 +7,8 @@ from dotenv import load_dotenv
 from pymongo import MongoClient, UpdateOne
 
 import uuid
-from supabase import create_client
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from datetime import datetime
 
 class ApiToMongo:
@@ -18,8 +19,11 @@ class ApiToMongo:
         self.col_name = os.getenv("collection_mongodb")
         self.api_url = os.getenv("api_url")
 
-        self.supabase_uri = os.getenv("SUPABASE_URL")
-        self.supabase_key = os.getenv("SUPABASE_KEY")
+        self.postgres_host = os.getenv("POSTGRES_HOST")
+        self.postgres_db = os.getenv("POSTGRES_DB")
+        self.postgres_user = os.getenv("POSTGRES_USER")
+        self.postgres_password = os.getenv("POSTGRES_PASSWORD")
+        self.postgres_port = os.getenv("POSTGRES_PORT", "5432")
 
         if not all([self.uri, self.db_name, self.col_name, self.api_url]):
             raise ValueError("Missing .env vars: mongo_uri, BASE_MONDOB, collection_mongodb, api_url")
@@ -64,17 +68,24 @@ class ApiToMongo:
         r.raise_for_status()
         payload = r.json()
 
+        t1 = time.time()
+        t_fetch = t1 - t0
+
         # 2) Extract records
         records = self._extract_records(payload)
         if not records:
             print("⚠️ No records found in API response (format inattendu).")
             return
+        
+        t2 = time.time()
+        t_extract = t2 - t1
 
         # 3) MongoDB : Connect + bulk upsert
-        client = MongoClient(self.uri, serverSelectionTimeoutMS=3000)
         try:
+            client = MongoClient(self.uri, serverSelectionTimeoutMS=5000)
             client.admin.command("ping")
-            col = client[self.db_name][self.col_name]
+            db = client[self.db_name]
+            col = db[self.col_name]
 
             ops = []
             for doc in records:
@@ -89,69 +100,103 @@ class ApiToMongo:
 
             result = col.bulk_write(ops, ordered=False)
 
-            dt = time.time() - t0
-            print(
-                "✅ Sync done | "
-                f"fetched={len(records)} | "
-                f"upserted={result.upserted_count} | "
-                f"modified={result.modified_count} | "
-                f"time={dt:.2f}s"
-            )
+            t3 = time.time()
+            t_mongo = t3 - t2
+
+            coll_stats = db.command("collStats", self.col_name)
+            mongo_disk_size_mb = coll_stats.get("storageSize", 0) / (1024 * 1024)
 
         finally:
             client.close()
 
-        # 4) Supabase : Connect + upsert
-
-        supabase = create_client(self.supabase_uri, self.supabase_key)
+        # 4) Postgres : Connect + upsert
         try:
+            t4 = time.time()
+
+            # Establish connection
+            # Ensure you have your connection string (e.g., "dbname=db user=user password=pw host=host")
+            conn = psycopg2.connect(
+                dbname=self.postgres_db,
+                user=self.postgres_user,
+                password=self.postgres_password,
+                host=self.postgres_host,
+                port=self.postgres_port
+            )
+            cur = conn.cursor(cursor_factory=RealDictCursor)
+
             for doc in records:
-
                 # --- 1. Insert or fetch site ---
-                site_resp = supabase.table("sites").select("id").eq(
-                    "identifiant", doc["id"]
-                ).execute()
-
-                if site_resp.data:
-                    site_id = site_resp.data[0]["id"]
-                else:
-                    site_insert = supabase.table("sites").insert({
-                        "identifiant": doc["id"],
-                        "nom": doc["name"],
-                        "date_installation": doc["installation_date"],
-                        "longitude": doc["coordinates"]["lon"],
-                        "latitude": doc["coordinates"]["lat"],
-                    }).execute()
-                    site_id = site_insert.data[0]["id"]
+                # Using ON CONFLICT allows us to handle the "fetch or insert" in one trip to the DB
+                cur.execute("""
+                    INSERT INTO sites (identifiant, nom, date_installation, longitude, latitude)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (identifiant) DO UPDATE SET identifiant = EXCLUDED.identifiant
+                    RETURNING id;
+                """, (
+                    doc["id"], 
+                    doc["name"], 
+                    doc["installation_date"], 
+                    doc["coordinates"]["lon"], 
+                    doc["coordinates"]["lat"]
+                ))
+                site_id = cur.fetchone()['id']
 
                 # --- 2. Insert or fetch compteur ---
-                compteur_resp = supabase.table("compteurs").select("id").eq(
-                    "identifiant", doc["id_compteur"]
-                ).execute()
-
-                if compteur_resp.data:
-                    compteur_id = compteur_resp.data[0]["id"]
-                else:
-                    compteur_insert = supabase.table("compteurs").insert({
-                        "identifiant": doc["id_compteur"],
-                        "nom": doc["nom_compteur"],
-                        "site_id": site_id,
-                    }).execute()
-                    compteur_id = compteur_insert.data[0]["id"]
+                cur.execute("""
+                    INSERT INTO compteurs (identifiant, nom, site_id)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (identifiant) DO UPDATE SET identifiant = EXCLUDED.identifiant
+                    RETURNING id;
+                """, (
+                    doc["id_compteur"], 
+                    doc["nom_compteur"], 
+                    site_id
+                ))
+                compteur_id = cur.fetchone()['id']
 
                 # --- 3. Insert comptage ---
-                supabase.table("comptages").insert({
-                    "date": doc["date"],
-                    "comptage_horaire": doc["sum_counts"],
-                    "photos": doc["photos"],
-                    "compteur_id": compteur_id,
-                }).execute()
+                cur.execute("""
+                    INSERT INTO comptages (date, comptage_horaire, photos, compteur_id)
+                    VALUES (%s, %s, %s, %s);
+                """, (
+                    doc["date"], 
+                    doc["sum_counts"], 
+                    doc["photos"], 
+                    compteur_id
+                ))
 
-                print("Data successfully inserted")
+            # Commit all changes at once for better performance
+            conn.commit()
+            
+            t5 = time.time()
+            t_postgres = t5 - t4
 
-        except:
-            print("Erreur avec Supabase")
+            cur.execute("SELECT pg_size_pretty(pg_database_size(current_database()));")
+            postgres_disk_size_mb = cur.fetchone().get("pg_size_pretty")
 
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            print(f"Error: {e}")
+
+        finally:
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+
+
+        # 5) Print summary
+        print(
+            "✅ Sync done | "
+            f"fetched={len(records)} | "
+            f"time_fetch={t_fetch:.2f}s | "
+            f"time_extract={t_extract:.2f}s | "
+            f"time_mongo={t_mongo:.2f}s | "
+            f"time_postgres={t_postgres:.2f}s | "
+            f"mongo_disk_size={mongo_disk_size_mb:.2f}MB | "
+            f"postgres_disk_size={postgres_disk_size_mb}"
+        )
 
 
 if __name__ == "__main__":
